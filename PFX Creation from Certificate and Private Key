@@ -1,0 +1,159 @@
+# Apigee LB — PFX Creation from Certificate and Private Key
+
+**Author:** Rakesh  
+**Environment:** Canara Bank — Apigee Edge Private Cloud (OPDK)  
+**Date:** 18-03-2026  
+**Purpose:** Create a PKCS#12 (PFX) bundle from a client-provided certificate and private key for use in Apigee Router / Load Balancer TLS configuration.
+
+---
+
+## Prerequisites
+
+- OpenSSL installed on the Linux server
+- Certificate and private key files received from the client
+
+---
+
+## Files Received from Client
+
+| File | Type | Description |
+|------|------|-------------|
+| `certificate.crt` | PEM Certificate | Server certificate provided by client |
+| `deceasedpvt.pem` | PEM File | Private key provided by client |
+
+---
+
+## Step 1 — Verify Certificate Format
+
+Check whether the certificate is in PEM or DER format:
+
+```bash
+file certificate.crt
+```
+
+**Output:**
+```
+certificate.crt: PEM certificate
+```
+
+Already in PEM format — no conversion needed.
+
+> If output shows binary/DER format, convert using:
+> ```bash
+> openssl x509 -inform DER -in certificate.crt -out certificate.crt
+> ```
+
+---
+
+## Step 2 — Verify Certificate and Private Key Match
+
+Before creating the PFX, confirm the certificate and private key belong together by comparing their modulus MD5 hash:
+
+```bash
+openssl x509 -noout -modulus -in certificate.crt | openssl md5
+openssl rsa  -noout -modulus -in deceasedpvt.pem  | openssl md5
+```
+
+✅ Both MD5 hashes matched — certificate and private key belong together.
+
+> If hashes do not match, the client has provided the wrong private key. Do not proceed.
+
+---
+
+## Step 3 — Create the PFX File
+
+```bash
+openssl pkcs12 -export -in certificate.crt -inkey deceasedpvt.pem -out apigee-lb.pfx -name "apigee-lb-alias" -passout pass:YourPassword
+```
+
+**Options explained:**
+
+| Option | Description |
+|--------|-------------|
+| `-in` | Input certificate file |
+| `-inkey` | Input private key file |
+| `-out` | Output PFX file name |
+| `-name` | Alias name used inside the keystore |
+| `-passout` | Export password (Apigee requires non-empty password) |
+
+✅ `apigee-lb.pfx` generated successfully.
+
+---
+
+## Step 4 — Verify the PFX
+
+```bash
+openssl pkcs12 -info -in apigee-lb.pfx -passin pass:YourPassword -noout
+```
+
+**Output:**
+```
+MAC: sha1, Iteration 2048
+MAC length: 20, salt length: 8
+PKCS7 Encrypted data: pbeWithSHA1And40BitRC2-CBC, Iteration 2048
+Certificate bag
+PKCS7 Data
+Shrouded Keybag: pbeWithSHA1And3-KeyTripleDES-CBC, Iteration 2048
+```
+
+✅ Certificate bag present — private key present — MAC verified.
+
+---
+
+## Step 5 — Upload to Apigee
+
+### Option A — Via Apigee Management UI
+
+1. Login to Apigee Edge UI
+2. Go to **Admin → TLS Keystores**
+3. Click **+ Keystore** → give a name (e.g. `lb-keystore-prod`)
+4. Click **+ Alias** → choose **Upload PKCS12**
+5. Upload `apigee-lb.pfx` and enter the export password
+6. Alias will be created as `apigee-lb-alias`
+
+### Option B — Via Management API
+
+```bash
+# Create keystore
+curl -u admin:password -X POST \
+  "http://localhost:8080/v1/organizations/<org>/environments/<env>/keystores" \
+  -H "Content-Type: application/json" \
+  -d '{"name":"lb-keystore-prod"}'
+
+# Upload PFX
+curl -u admin:password -X POST \
+  "http://localhost:8080/v1/organizations/<org>/environments/<env>/keystores/lb-keystore-prod/aliases?format=pkcs12&alias=apigee-lb-alias" \
+  -H "Content-Type: multipart/form-data" \
+  -F "file=@apigee-lb.pfx" \
+  -F "password=YourPassword"
+```
+
+---
+
+## Quick Verification Checklist
+
+| Check | Command |
+|-------|---------|
+| Cert not expired | `openssl x509 -noout -dates -in certificate.crt` |
+| Modulus match (cert vs key) | Compare MD5 of both |
+| CN / SAN matches LB hostname | `openssl x509 -noout -text -in certificate.crt \| grep -E "CN\|DNS"` |
+| PFX password is non-empty | Apigee rejects empty passwords |
+
+---
+
+## Notes
+
+- Always keep the original `certificate.crt` and `deceasedpvt.pem` backed up separately.
+- When the certificate renews, rebuild the PFX using the same steps.
+- If a CA chain (intermediate/root cert) is provided by the client, bundle it before creating PFX:
+  ```bash
+  cat certificate.crt intermediate.crt root.crt > fullchain.crt
+  ```
+  Then use `fullchain.crt` in place of `certificate.crt` in Step 3.
+
+---
+
+## References
+
+- [Apigee Edge — Keystores and Truststore](https://docs.apigee.com/api-platform/system-administration/keystores-truststores)
+- [OpenSSL PKCS12 man page](https://www.openssl.org/docs/man1.1.1/man1/pkcs12.html)
