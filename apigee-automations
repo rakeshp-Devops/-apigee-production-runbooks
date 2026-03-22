@@ -1,0 +1,243 @@
+# ZooKeeper Health Check — Deployment Runbook
+
+**Environment:** Apigee OPDK Preprod  
+**Author:** Rakesh  
+**Date:** 2026-03-22  
+**Status:** Deployed & Verified ✅
+
+---
+
+## Overview
+
+Automated ZooKeeper health monitoring script deployed across all 3 ZK nodes in the Apigee OPDK preprod cluster. The script runs every 5 minutes via cron, performs 10 health checks per node, and logs results to `/var/log/zk_health.log` with 14-day logrotate retention.
+
+---
+
+## Cluster Details
+
+| Node IP | Hostname | Role |
+|---|---|---|
+| ZK-NODE-1-IP | ZK-NODE-1-HOSTNAME | Follower |
+| ZK-NODE-2-IP | ZK-NODE-2-HOSTNAME | Follower |
+| ZK-NODE-3-IP | ZK-NODE-3-HOSTNAME | Leader |
+
+- ZooKeeper Port: `2181`
+- Quorum requirement: 2 out of 3 nodes
+- OneAgent (Dynatrace): running on all nodes
+
+---
+
+## What the Script Checks
+
+| # | Check | Method | Threshold |
+|---|---|---|---|
+| 1 | Node availability | `echo ruok \| nc` → expects `imok` | Must return imok |
+| 2 | Node role | `echo srvr \| nc` → grep `Mode:` | leader or follower |
+| 3 | Average latency | `mntr` → `zk_avg_latency` | Warn if > 500ms |
+| 4 | Outstanding requests | `mntr` → `zk_outstanding_requests` | Warn if > 10 |
+| 5 | Alive connections | `mntr` → `zk_num_alive_connections` | Logged |
+| 6 | Pending syncs | `mntr` → `zk_pending_syncs` | Logged |
+| 7 | Ephemeral nodes | `mntr` → `zk_ephemerals_count` | Logged |
+| 8 | Watch count | `mntr` → `zk_watch_count` | Logged |
+| 9 | Quorum validation | Sum of reachable nodes | CRITICAL if < 2/3 |
+| 10 | Leader count | Count of leader-mode nodes | CRITICAL if != 1 |
+
+---
+
+## Script
+
+**Path:** `/opt/apigee/scripts/zk_health_check.sh`  
+**Owner:** `apigee:apigee`  
+**Permissions:** `750`
+
+```bash
+#!/bin/bash
+
+LOG=/var/log/zk_health.log
+TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S')
+ZK_NODES=("ZK-NODE-1-IP" "ZK-NODE-2-IP" "ZK-NODE-3-IP")
+ZK_PORT=2181
+LATENCY_WARN=500
+
+log() { echo "[$TIMESTAMP] $1" >> "$LOG"; }
+
+log "===== ZK Health Check Start ====="
+
+LEADER_COUNT=0
+FOLLOWER_COUNT=0
+
+for NODE in "${ZK_NODES[@]}"; do
+  log "--- Checking node: $NODE ---"
+
+  RUOK=$(echo ruok | nc -w 3 "$NODE" "$ZK_PORT" 2>/dev/null)
+  if [ "$RUOK" != "imok" ]; then
+    log "CRITICAL: Node $NODE ruok FAILED - node may be DOWN"
+    continue
+  fi
+  log "Node $NODE: ruok=imok OK"
+
+  SRVR=$(echo srvr | nc -w 3 "$NODE" "$ZK_PORT" 2>/dev/null)
+  MODE=$(echo "$SRVR" | grep "Mode:" | awk '{print $2}')
+  log "Node $NODE: mode=$MODE"
+  [ "$MODE" = "leader" ]   && LEADER_COUNT=$((LEADER_COUNT+1))
+  [ "$MODE" = "follower" ] && FOLLOWER_COUNT=$((FOLLOWER_COUNT+1))
+  [ -z "$MODE" ] && log "WARNING: Node $NODE mode unknown"
+
+  MNTR=$(echo mntr | nc -w 3 "$NODE" "$ZK_PORT" 2>/dev/null)
+  AVG_LAT=$(echo "$MNTR" | grep "zk_avg_latency"           | awk '{print $2}')
+  OUT_REQ=$(echo "$MNTR" | grep "zk_outstanding_requests"  | awk '{print $2}')
+  CONNS=$(echo   "$MNTR" | grep "zk_num_alive_connections" | awk '{print $2}')
+  PSYNCS=$(echo  "$MNTR" | grep "zk_pending_syncs"         | awk '{print $2}')
+  EPH=$(echo     "$MNTR" | grep "zk_ephemerals_count"      | awk '{print $2}')
+  WATCHES=$(echo "$MNTR" | grep "zk_watch_count"           | awk '{print $2}')
+
+  log "Node $NODE: avg_latency=${AVG_LAT}ms"
+  log "Node $NODE: outstanding_requests=$OUT_REQ"
+  log "Node $NODE: alive_connections=$CONNS"
+  log "Node $NODE: pending_syncs=$PSYNCS"
+  log "Node $NODE: ephemerals=$EPH"
+  log "Node $NODE: watch_count=$WATCHES"
+
+  if [ -n "$AVG_LAT" ] && [ "$AVG_LAT" -gt "$LATENCY_WARN" ] 2>/dev/null; then
+    log "WARNING: Node $NODE high latency ${AVG_LAT}ms > threshold ${LATENCY_WARN}ms"
+  fi
+  if [ -n "$OUT_REQ" ] && [ "$OUT_REQ" -gt 10 ] 2>/dev/null; then
+    log "WARNING: Node $NODE outstanding_requests=$OUT_REQ (>10)"
+  fi
+
+done
+
+TOTAL_REACHABLE=$((LEADER_COUNT + FOLLOWER_COUNT))
+log "Quorum: leaders=$LEADER_COUNT followers=$FOLLOWER_COUNT reachable=$TOTAL_REACHABLE/3"
+[ "$TOTAL_REACHABLE" -lt 2 ] && \
+  log "CRITICAL: Quorum LOST - only $TOTAL_REACHABLE/3 nodes reachable"
+[ "$LEADER_COUNT" -ne 1 ] && [ "$TOTAL_REACHABLE" -ge 2 ] && \
+  log "CRITICAL: Leader anomaly - $LEADER_COUNT leaders detected, expected 1"
+
+log "===== ZK Health Check Complete ====="
+```
+
+---
+
+## Deployment Steps
+
+### Step 1 — Create script on each node
+
+```bash
+mkdir -p /opt/apigee/scripts
+# paste script content above
+chmod 750 /opt/apigee/scripts/zk_health_check.sh
+chown apigee:apigee /opt/apigee/scripts/zk_health_check.sh
+```
+
+### Step 2 — Create log file
+
+```bash
+touch /var/log/zk_health.log
+chmod 644 /var/log/zk_health.log
+chown apigee:apigee /var/log/zk_health.log
+```
+
+> `644` required so Dynatrace OneAgent can read the log file.
+
+### Step 3 — Test run
+
+```bash
+bash /opt/apigee/scripts/zk_health_check.sh
+cat /var/log/zk_health.log
+```
+
+Expected healthy output:
+```
+[2026-03-22 11:20:24] ===== ZK Health Check Start =====
+[2026-03-22 11:20:24] Node ZK-NODE-1-IP: ruok=imok OK
+[2026-03-22 11:20:24] Node ZK-NODE-1-IP: mode=follower
+...
+[2026-03-22 11:20:24] Quorum: leaders=1 followers=2 reachable=3/3
+[2026-03-22 11:20:24] ===== ZK Health Check Complete =====
+```
+
+### Step 4 — Schedule cron
+
+```bash
+crontab -e
+# Add:
+*/5 * * * * /opt/apigee/scripts/zk_health_check.sh
+```
+
+### Step 5 — Configure logrotate
+
+```bash
+cat > /etc/logrotate.d/zk_health << 'EOF'
+/var/log/zk_health.log {
+    daily
+    rotate 14
+    compress
+    delaycompress
+    missingok
+    notifempty
+    dateext
+    dateformat -%Y%m%d
+}
+EOF
+
+logrotate -d /etc/logrotate.d/zk_health
+```
+
+---
+
+## Verification Commands
+
+```bash
+# Check latest log output
+tail -40 /var/log/zk_health.log
+
+# Confirm cron is active
+crontab -l
+
+# Manual health check
+bash /opt/apigee/scripts/zk_health_check.sh
+
+# Quick ZK status from any node
+echo ruok | nc -w 3 <ZK-NODE-1-IP> 2181
+echo ruok | nc -w 3 <ZK-NODE-2-IP> 2181
+echo ruok | nc -w 3 <ZK-NODE-3-IP> 2181
+
+# Check leader
+for ip in <ZK-NODE-1-IP> <ZK-NODE-2-IP> <ZK-NODE-3-IP>; do
+  echo -n "$ip: "; echo srvr | nc -w 3 $ip 2181 | grep Mode
+done
+```
+
+---
+
+## Cluster Health at Deployment
+
+| Node | Role | Latency | Connections | Watches | Ephemerals |
+|---|---|---|---|---|---|
+| ZK-NODE-1 | Follower | 0.048ms | 7 | 387 | 3 |
+| ZK-NODE-2 | Follower | 0.097ms | 4 | 62 | 3 |
+| ZK-NODE-3 | Leader | 0.083ms | 11 | 102 | 3 |
+
+**Quorum:** 3/3 reachable · **Leader:** 1 (ZK-NODE-3) · **Swap:** 0 on all nodes
+
+---
+
+## Runtime Impact Assessment
+
+| Metric | Impact |
+|---|---|
+| CPU | ~50ms execution per run — negligible on 8-core servers |
+| RAM | ~3-4MB during execution, released immediately |
+| Disk | ~500KB/day log growth, capped at 14 days (~3MB total) |
+| ZK traffic | Read-only four-letter commands via dedicated admin thread |
+| API traffic | Zero — no interaction with Apigee runtime pipeline |
+
+---
+
+## Notes
+
+- `pending_syncs` is empty on followers (`.80`, `.81`) — this is expected. Only the leader (`.82`) reports this metric.
+- `watch_count=387` on ZK-NODE-1 is higher than other nodes — monitor over time. May indicate one Apigee component connecting preferentially to this node.
+- Dynatrace OneAgent is active on all 3 nodes — log monitoring can be configured via Dynatrace UI under `Settings → Log Monitoring → Log sources` pointing to `/var/log/zk_health.log`.
+- No CMR required for this deployment — script uses only read-only ZK four-letter commands and writes only to local log file.
