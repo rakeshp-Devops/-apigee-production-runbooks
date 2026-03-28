@@ -1,183 +1,239 @@
-# 🔧 Apigee Production Runbooks
+# Apigee Production Runbooks
 
-> Real-world incident reports, RCAs, and operational runbooks from Apigee Edge OPDK production environments.
-> Maintained by **Rakesh P** — Apigee Administrator | API Platform Engineer
-
----
-
-## 📁 Incident Index
-
-| # | Date | Severity | Component | Title | Status |
-|---|------|----------|-----------|-------|--------|
-| 001 | 2026-03-18 | 🟡 Medium | Message Processor | [Apigee Proxy Undeploy Failure — UnknownEventReceived](#-incident-001--apigee-proxy-undeploy-failure) | ✅ Resolved |
+> Sanitized runbooks from real production incidents on Apigee Edge OPDK (Private Cloud).
+> All sensitive IPs, hostnames, and credentials have been replaced with placeholders.
 
 ---
 
-## 🚨 Incident 001 — Apigee Proxy Undeploy Failure
+## 📋 Runbook Index
 
-### `messaging.runtime.UnknownEventReceived` on DC2 Message Processor
-
----
-
-### 📋 Incident Summary
-
-| Field | Details |
-|-------|---------|
-| **Incident ID** | INC-001 |
-| **Date & Time** | March 18, 2026 — 13:52:18 IST |
-| **Environment** | Production — `org/prod` |
-| **Affected Proxy** | `getCase-Passthrough-v1` — Revision 1 |
-| **Severity** | 🟡 Medium |
-| **Duration** | ~10 minutes |
-| **Impact** | Deployment pipeline blocked — No live traffic impact |
-| **Resolved By** | Apigee Administrator |
+| # | Incident | Severity | Components |
+|---|---|---|---|
+| 01 | [504 Gateway Timeout — Cassandra PoolTimeoutException](#01-504-gateway-timeout) | P1 | Apigee MP, Cassandra |
+| 02 | [Stuck Message Processor Thread](#02-stuck-mp-thread) | P1 | Apigee MP |
+| 03 | [PostgreSQL Disk Space Exhaustion](#03-postgresql-disk-space) | P2 | PostgreSQL |
+| 04 | [ZooKeeper Health Degradation](#04-zookeeper-health) | P2 | ZooKeeper, Apigee |
+| 05 | [Proxy Undeploy Failure](#05-proxy-undeploy-failure) | P2 | Apigee MP |
 
 ---
 
-### ⏱️ Timeline
+## 01 — 504 Gateway Timeout
 
-```
-13:52:07  Analytics stats query executed successfully (PostgreSQL, 75ms)
-13:52:18  Undeploy (DELETE) triggered for getCase-Passthrough-v1 rev 1
-13:52:18  ZooKeeper: spec.xml and _deploymentBean paths deleted successfully
-13:52:19  ✅ Undeploy successful on all 19 Routers
-13:52:19  ❌ ERROR: DC2 Message Processor — UnknownEventReceived
-13:52:19  ✅ Undeploy successful on 7 of 8 Message Processors
-13:52:19  ⚠️  ZooKeeper success-node statuses rolled back (partial failure)
-13:52:19  ❌ Overall undeploy marked FAILED by Management Server
-~14:00    Admin identified failing MP UUID → mapped to DC2 node
-~14:02    MP restarted → undeploy retried → completed successfully ✅
-```
+**Root Cause:** Cassandra PoolTimeoutException causing Apigee Message Processor to time out on policy execution.
 
----
+### Symptoms
+- API consumers receiving `504 Gateway Timeout`
+- Kibana showing spike in `fault.name = messaging.adaptors.http.flow.RequestTimeout`
+- `nodetool tpstats` showing dropped messages on `READ` and `MUTATION` stages
 
-### 🔍 Error from Logs
+### Diagnosis Steps
 
-```log
-ERROR DISTRIBUTION - HTTPWaiter.await() : Exception java.util.concurrent.ExecutionException
-  com.apigee.events.EventHandlingFailureException{
-    code    = events.EventHandlingFailure,
-    message = Remote server failed to handle event.
-    error code: messaging.runtime.UnknownEventReceived
-    error message: Received an unknown event with description
-      DELETE Application /organizations/<org>/apiproxies/getCase-Passthrough-v1/revisions/1/
-  }
-
-ERROR DISTRIBUTION - RemoteServicesUnDeploymentHandler.unDeployFromServers()
-  Undeploy failed from message-processor <mp-uuid>
-  cause = Remote server failed to handle event.
-  error code: messaging.runtime.UnknownEventReceived
-  communication error = false
-```
-
----
-
-### 🧩 Root Cause
-
-The Message Processor on DC2 (Disaster Recovery datacenter) had its **internal event-handling thread stuck in a degraded state**.
-
-- The JVM process was alive and responding to health checks on port `8082`
-- Internal Netty/event-loop threads responsible for processing deployment lifecycle events were deadlocked
-- The MP appeared healthy externally (`isUp: true`, `reachable: true`) but silently rejected all deployment events
-- All other 7 MPs in the pod processed the undeploy successfully — only the DC2 MP failed
-
-> **Key Insight:** In Apigee OPDK, even 1 MP failure out of 8 causes the entire undeploy to be marked FAILED and ZooKeeper status nodes are rolled back.
-
----
-
-### 💥 Impact Assessment
-
-| Area | Impact |
-|------|--------|
-| Live API Traffic | ✅ No impact |
-| Other Proxies | ✅ No impact |
-| Deployment Pipeline | ❌ Blocked ~10 minutes |
-| ZooKeeper | ⚠️ Temporary stale status nodes (auto-cleaned post-restart) |
-| Data / Transactions | ✅ None |
-
----
-
-### 🛠️ Resolution Steps
-
-**Step 1 — Identify the failing MP UUID from Management Server logs**
-```
-Look for: messaging.runtime.UnknownEventReceived
-Extract the MP UUID from the error line in ms-log
-```
-
-**Step 2 — Map UUID to hostname using Management API**
 ```bash
-curl -s -u <admin-user>:<password> \
-  "http://<management-server>:8080/v1/servers?pod=<pod-name>&region=<region>&type=message-processor"
+# Check Apigee MP logs
+tail -f /opt/apigee/var/log/edge-message-processor/logs/system.log | grep -i "cassandra\|timeout\|pool"
+
+# Check Cassandra dropped messages
+nodetool tpstats | grep -E "Dropped|READ|MUTATION|WRITE"
+
+# Check Cassandra heap
+nodetool info | grep -i heap
+
+# Check pending compactions
+nodetool compactionstats
+
+# Check GC pause times
+grep "GCInspector" /var/log/cassandra/system.log | tail -20
 ```
 
-**Step 3 — Confirm UUID on the suspect node**
+### Resolution Steps
+
 ```bash
-curl -s http://<mp-host>:8082/v1/servers/self | grep -i uuid
+# 1. Identify the overloaded Cassandra node
+nodetool status
+
+# 2. Flush memtables to reduce pending writes
+nodetool flush
+
+# 3. If heap is high (>75%), trigger GC
+nodetool gcstats
+
+# 4. Restart Cassandra on the affected node (last resort)
+/opt/apigee/apigee-service/bin/apigee-service apigee-cassandra restart
+
+# 5. Verify recovery
+nodetool tpstats
+nodetool status
 ```
 
-**Step 4 — Restart the Message Processor**
+### Prevention
+- Set up cron-based tpstats monitoring (see: linux-monitoring-scripts repo)
+- Alert when dropped messages > 0 for READ or MUTATION stages
+- Monitor heap usage — alert at 70%, page at 80%
+
+---
+
+## 02 — Stuck MP Thread
+
+**Root Cause:** A Message Processor thread stuck in WAITING state, preventing proxy undeployment.
+
+### Symptoms
+- Proxy undeploy returns success but proxy remains active
+- MP logs show UUID thread in WAITING state
+- `curl` to MP management API returns stale deployment info
+
+### Diagnosis Steps
+
 ```bash
-ssh root@<mp-host>
+# Check MP deployment status
+curl -u admin:PASSWORD http://MP-HOST:8082/v1/runtime/organizations/ORG/environments/ENV/apis/PROXY/revisions
+
+# Get thread dump
+curl http://MP-HOST:8082/v1/threads > /tmp/threaddump-$(date +%s).txt
+
+# Search for stuck thread by proxy name
+grep -A 20 "PROXY_NAME" /tmp/threaddump-*.txt
+```
+
+### Resolution Steps
+
+```bash
+# 1. Identify stuck thread UUID from thread dump
+# Look for: state: WAITING, proxy: YOUR_PROXY_NAME
+
+# 2. Restart the specific MP (if single-node issue)
+/opt/apigee/apigee-service/bin/apigee-service edge-message-processor restart
+
+# 3. Verify proxy is undeployed after restart
+curl -u admin:PASSWORD http://MP-HOST:8082/v1/runtime/organizations/ORG/environments/ENV/apis/PROXY/revisions
+
+# 4. Redeploy proxy from Edge UI or management API
+```
+
+---
+
+## 03 — PostgreSQL Disk Space Exhaustion
+
+**Root Cause:** `log_statement = 'all'` enabled in PostgreSQL config causing rapid log growth.
+
+### Symptoms
+- Disk usage on PostgreSQL server >85%
+- Apigee analytics data not appearing in Edge UI
+- PostgreSQL service slow or unresponsive
+
+### Diagnosis Steps
+
+```bash
+# Check disk usage
+df -h /
+
+# Find largest files
+du -sh /var/lib/postgresql/*/main/pg_log/* | sort -rh | head -10
+
+# Check current log_statement setting
+sudo -u postgres psql -c "SHOW log_statement;"
+```
+
+### Resolution Steps
+
+```bash
+# 1. Truncate the large log file (DO NOT delete — file may be open)
+sudo truncate -s 0 /var/log/postgresql/postgresql-*.log
+
+# 2. Disable log_statement in postgresql.conf
+sudo sed -i "s/^log_statement = 'all'/log_statement = 'none'/" /etc/postgresql/*/main/postgresql.conf
+
+# 3. Reload PostgreSQL config
+sudo -u postgres psql -c "SELECT pg_reload_conf();"
+
+# 4. Verify disk freed
+df -h /
+
+# 5. Verify setting applied
+sudo -u postgres psql -c "SHOW log_statement;"
+```
+
+### Prevention
+- Never enable `log_statement = 'all'` in production
+- Set up disk usage alerts at 70% and 80%
+- Configure logrotate for PostgreSQL logs
+
+---
+
+## 04 — ZooKeeper Health Degradation
+
+**Root Cause:** ZooKeeper node losing quorum or high latency causing Apigee cluster instability.
+
+### Diagnosis Steps
+
+```bash
+# Check ZooKeeper status on each node
+echo "ruok" | nc ZK-HOST 2181
+echo "stat" | nc ZK-HOST 2181 | grep -E "Mode|Connections|Outstanding"
+echo "mntr" | nc ZK-HOST 2181 | grep -E "zk_avg_latency|zk_outstanding_requests|zk_pending_syncs"
+
+# Check ZooKeeper process
+/opt/apigee/apigee-service/bin/apigee-service apigee-zookeeper status
+```
+
+### Resolution Steps
+
+```bash
+# Restart ZooKeeper on the degraded node
+/opt/apigee/apigee-service/bin/apigee-service apigee-zookeeper restart
+
+# Verify quorum restored
+echo "stat" | nc ZK-HOST 2181 | grep Mode
+# Expected: Mode: follower (or leader on leader node)
+```
+
+---
+
+## 05 — Proxy Undeploy Failure
+
+**Root Cause:** Proxy stuck in deployed state due to MP thread or ZooKeeper sync issue.
+
+### Resolution Steps
+
+```bash
+# Force undeploy via management API
+curl -X DELETE \
+  -u admin:PASSWORD \
+  "http://MS-HOST:8080/v1/organizations/ORG/environments/ENV/apis/PROXY/revisions/REV/deployments"
+
+# If above fails, restart MP on affected DC
 /opt/apigee/apigee-service/bin/apigee-service edge-message-processor restart
 ```
 
-**Step 5 — Retry the undeploy**
-```bash
-curl -X DELETE \
-  -u <admin-user>:<password> \
-  "http://<management-server>:8080/v1/organizations/<org>/environments/<env>/apiproxies/<proxy-name>/revisions/<rev>/deployments"
+---
+
+## 🏗️ Environment Reference
+
+| Component | Count | Notes |
+|---|---|---|
+| Gateway (Router + MP) | 4 nodes | Combined deployment |
+| MicroGateway | 4 nodes | Separate cluster |
+| Cassandra / ZooKeeper | 3 nodes | Co-located |
+| PostgreSQL | 1 node | Analytics |
+
+---
+
+## 📁 Folder Structure
+
+```
+apigee-production-runbooks/
+├── README.md                  # This file — runbook index
+├── runbooks/
+│   ├── 01-cassandra-pool-timeout.md
+│   ├── 02-stuck-mp-thread.md
+│   ├── 03-postgresql-disk-space.md
+│   ├── 04-zookeeper-health.md
+│   └── 05-proxy-undeploy-failure.md
+├── scripts/
+│   └── health-check-all.sh    # Runs all health checks
+└── templates/
+    └── rca-template.md        # RCA document template
 ```
 
-✅ Undeploy completed successfully after restart.
-
 ---
 
-### 🔒 Preventive Actions
-
-| # | Action | Target Date |
-|---|--------|-------------|
-| 1 | Add MP health check validating event-handling via `/v1/servers/self` — not just process status | Week 1 |
-| 2 | Configure monitoring alert for MP uptime > 7 days — schedule rolling restarts in maintenance window | Week 2 |
-| 3 | Ensure DC2/DR MPs are included in monitoring dashboards equally with DC1 | Week 1 |
-| 4 | Document runbook: Recovery steps for `UnknownEventReceived` MP failures | Week 3 |
-
----
-
-### 💡 Lessons Learned
-
-- **Process running ≠ Service healthy** — always validate via the MP management API (`/v1/servers/self`), not just `apigee-service status`
-- **Multi-DC OPDK** — DC2/DR MPs must be included in all monitoring and health-check routines equally with DC1
-- **Apigee all-or-nothing behavior** — a single MP failure blocks the entire deploy/undeploy operation; MP health monitoring is critical
-- **UUID-to-IP mapping** — the fastest way to identify a failing physical node from log UUIDs is via `/v1/servers` Management API
-
----
-
-### 🏷️ Tags
-
-`apigee` `apigee-opdk` `message-processor` `undeploy-failure` `UnknownEventReceived` `production-incident` `rca` `apigee-edge` `rhel` `zookeeper`
-
----
-
-## 🧰 Environment Reference
-
-| Component | Details |
-|-----------|---------|
-| Platform | Apigee Edge OPDK (Private Cloud) |
-| OS | RHEL 8 |
-| Deployment | Multi-datacenter (DC1 Primary + DC2 DR) |
-| Components | Management Server, Router, Message Processor, ZooKeeper, Cassandra, PostgreSQL |
-
----
-
-## 👤 Author
-
-**Rakesh P**
-Apigee Administrator | API Platform Engineer
-[GitHub](https://github.com/rakeshp-Devops)
-
-> ⚠️ *All internal IPs, hostnames, org names, credentials, and environment-specific details have been masked or replaced with placeholders before publishing. This repository is for knowledge sharing and professional reference only.*
-
----
-
-*Last updated: March 18, 2026*
+*Maintained by Rakesh Gowda — Apigee Infrastructure Engineer*
